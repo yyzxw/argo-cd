@@ -2476,31 +2476,9 @@ func (s *Service) GetHelmCharts(ctx context.Context, q *apiclient.HelmChartsRequ
 }
 
 func (s *Service) TestRepository(ctx context.Context, q *apiclient.TestRepositoryRequest) (*apiclient.TestRepositoryResponse, error) {
-	repo := q.Repo
-	// per Type doc, "git" should be assumed if empty or absent
-	if repo.Type == "" {
-		repo.Type = "git"
-	}
-	checks := map[string]func() error{
-		"git": func() error {
-			return git.TestRepo(repo.Repo, repo.GetGitCreds(s.gitCredsStore), repo.IsInsecure(), repo.IsLFSEnabled(), repo.Proxy)
-		},
-		"helm": func() error {
-			if repo.EnableOCI {
-				if !helm.IsHelmOciRepo(repo.Repo) {
-					return errors.New("OCI Helm repository URL should include hostname and port only")
-				}
-				_, err := helm.NewClient(repo.Repo, repo.GetHelmCreds(), repo.EnableOCI, repo.Proxy).TestHelmOCI()
-				return err
-			} else {
-				_, err := helm.NewClient(repo.Repo, repo.GetHelmCreds(), repo.EnableOCI, repo.Proxy).GetIndex(false, s.initConstants.HelmRegistryMaxIndexSize)
-				return err
-			}
-		},
-	}
-	check := checks[repo.Type]
 	apiResp := &apiclient.TestRepositoryResponse{VerifiedRepository: false}
-	err := check()
+	testRepoFunc := s.GetTestRepoFunc(q.Repo)
+	err := testRepoFunc()
 	if err != nil {
 		return apiResp, fmt.Errorf("error testing repository connectivity: %w", err)
 	}
@@ -2778,4 +2756,35 @@ func (s *Service) updateCachedRevision(logCtx *log.Entry, oldRev string, newRev 
 
 	logCtx.Debugf("manifest cache updated for application %s in repo %s from revision %s to revision %s", request.AppName, request.GetRepo().Repo, oldRev, newRev)
 	return nil
+}
+
+type TestRepositoryFunc func() error
+
+func TestGitRepo(repo *v1alpha1.Repository, store git.CredsStore) TestRepositoryFunc {
+	return func() error {
+		return git.TestRepo(repo.Repo, repo.GetGitCreds(store), repo.IsInsecure(), repo.IsLFSEnabled(), repo.Proxy)
+	}
+}
+
+func TestHelmRepo(repo *v1alpha1.Repository, indexSize int64) TestRepositoryFunc {
+	return func() error {
+		if repo.EnableOCI {
+			if !helm.IsHelmOciRepo(repo.Repo) {
+				return errors.New("OCI Helm repository URL should include hostname and port only")
+			}
+			_, err := helm.NewClient(repo.Repo, repo.GetHelmCreds(), repo.EnableOCI, repo.Proxy).TestHelmOCI()
+			return err
+		} else {
+			_, err := helm.NewClient(repo.Repo, repo.GetHelmCreds(), repo.EnableOCI, repo.Proxy).GetIndex(false, indexSize)
+			return err
+		}
+	}
+}
+
+func (s *Service) GetTestRepoFunc(repo *v1alpha1.Repository) TestRepositoryFunc {
+	if repo.Type == "helm" {
+		return TestHelmRepo(repo, s.initConstants.HelmRegistryMaxIndexSize)
+	}
+	// default to git
+	return TestGitRepo(repo, s.gitCredsStore)
 }

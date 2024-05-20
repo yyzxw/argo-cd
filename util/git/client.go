@@ -30,6 +30,8 @@ import (
 	"golang.org/x/crypto/ssh/knownhosts"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/retry"
 
 	"github.com/argoproj/argo-cd/v2/common"
 	certutil "github.com/argoproj/argo-cd/v2/util/cert"
@@ -111,21 +113,14 @@ type runOpts struct {
 }
 
 var (
-	maxAttemptsCount = 1
+	maxAttemptsCount = int64(1)
 	maxRetryDuration time.Duration
 	retryDuration    time.Duration
 	factor           int64
 )
 
 func init() {
-	if countStr := os.Getenv(common.EnvGitAttemptsCount); countStr != "" {
-		if cnt, err := strconv.Atoi(countStr); err != nil {
-			panic(fmt.Sprintf("Invalid value in %s env variable: %v", common.EnvGitAttemptsCount, err))
-		} else {
-			maxAttemptsCount = int(math.Max(float64(cnt), 1))
-		}
-	}
-
+	maxAttemptsCount = env.ParseInt64FromEnv(common.EnvGitAttemptsCount, maxAttemptsCount, 1, math.MaxInt64)
 	maxRetryDuration = env.ParseDurationFromEnv(common.EnvGitRetryMaxDuration, common.DefaultGitRetryMaxDuration, 0, math.MaxInt64)
 	retryDuration = env.ParseDurationFromEnv(common.EnvGitRetryDuration, common.DefaultGitRetryDuration, 0, math.MaxInt64)
 	factor = env.ParseInt64FromEnv(common.EnvGitRetryFactor, common.DefaultGitRetryFactor, 0, math.MaxInt64)
@@ -580,22 +575,23 @@ func (m *nativeGitClient) LsRefs() (*Refs, error) {
 // runs with in-memory storage and is safe to run concurrently, or to be run without a git
 // repository locally cloned.
 func (m *nativeGitClient) LsRemote(revision string) (res string, err error) {
-	for attempt := 0; attempt < maxAttemptsCount; attempt++ {
-		res, err = m.lsRemote(revision)
-		if err == nil {
-			return
-		} else if apierrors.IsInternalError(err) || apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) ||
-			apierrors.IsTooManyRequests(err) || utilnet.IsProbableEOF(err) || utilnet.IsConnectionReset(err) {
-			// Formula: timeToWait = duration * factor^retry_number
-			// Note that timeToWait should equal to duration for the first retry attempt.
-			// When timeToWait is more than maxDuration retry should be performed at maxDuration.
-			timeToWait := float64(retryDuration) * (math.Pow(float64(factor), float64(attempt)))
-			if maxRetryDuration > 0 {
-				timeToWait = math.Min(float64(maxRetryDuration), timeToWait)
-			}
-			time.Sleep(time.Duration(timeToWait))
-		}
+	retryOpts := wait.Backoff{
+		Duration: retryDuration,
+		Factor:   float64(factor),
+		Jitter:   retry.DefaultRetry.Jitter,
+		Steps:    int(maxAttemptsCount),
+		Cap:      maxRetryDuration,
 	}
+
+	retryable := func(err error) bool {
+		return apierrors.IsInternalError(err) || apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) ||
+			apierrors.IsTooManyRequests(err) || utilnet.IsProbableEOF(err) || utilnet.IsConnectionReset(err)
+	}
+
+	err = retry.OnError(retryOpts, retryable, func() error {
+		res, err = m.lsRemote(revision)
+		return err
+	})
 	return
 }
 
